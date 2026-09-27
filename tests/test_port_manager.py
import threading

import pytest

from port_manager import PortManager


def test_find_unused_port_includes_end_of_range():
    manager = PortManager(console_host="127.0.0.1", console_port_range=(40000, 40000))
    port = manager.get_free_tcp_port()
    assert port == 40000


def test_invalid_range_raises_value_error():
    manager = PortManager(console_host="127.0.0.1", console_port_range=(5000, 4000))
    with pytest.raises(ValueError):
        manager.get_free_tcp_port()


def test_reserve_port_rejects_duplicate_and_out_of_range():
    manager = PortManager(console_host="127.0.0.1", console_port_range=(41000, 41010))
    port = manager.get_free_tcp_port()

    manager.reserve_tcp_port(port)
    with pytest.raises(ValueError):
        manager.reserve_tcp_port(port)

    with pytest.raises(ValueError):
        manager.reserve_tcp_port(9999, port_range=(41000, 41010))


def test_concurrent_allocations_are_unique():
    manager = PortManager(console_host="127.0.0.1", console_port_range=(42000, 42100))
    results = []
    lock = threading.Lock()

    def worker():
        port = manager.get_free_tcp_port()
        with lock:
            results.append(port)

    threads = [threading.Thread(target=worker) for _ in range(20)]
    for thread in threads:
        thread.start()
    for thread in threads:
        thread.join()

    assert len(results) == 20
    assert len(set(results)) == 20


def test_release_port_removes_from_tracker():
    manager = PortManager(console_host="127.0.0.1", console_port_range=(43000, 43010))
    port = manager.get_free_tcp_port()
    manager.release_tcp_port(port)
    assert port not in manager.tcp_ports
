@@ -1,0 +1,139 @@
+import socket
+import threading
+from contextlib import closing
+
+
+BANNED_PORTS = {
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53,
+    77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117,
+    119, 123, 135, 139, 143, 179, 389, 465, 512, 513, 514, 515, 526,
+    530, 531, 532, 540, 556, 563, 587, 601, 636, 993, 995, 2049, 3659,
+    4045, 6000, 6665, 6666, 6667, 6668, 6669,
+}
+
+
+class PortManager:
+    """Simple, thread-safe port allocator for TCP and UDP ports."""
+
+    def __init__(
+        self,
+        console_host="127.0.0.1",
+        udp_host="0.0.0.0",
+        console_port_range=(5000, 10000),
+        udp_port_range=(20000, 30000),
+        banned_ports=None,
+    ):
+        self._console_host = console_host
+        self._udp_host = udp_host
+        self._console_port_range = console_port_range
+        self._udp_port_range = udp_port_range
+        self._used_tcp_ports = set()
+        self._used_udp_ports = set()
+        self._lock = threading.RLock()
+        self._banned_ports = set(BANNED_PORTS)
+        if banned_ports:
+            self._banned_ports.update(banned_ports)
+
+    @staticmethod
+    def _socket_family(socket_type):
+        if socket_type == "TCP":
+            return socket.SOCK_STREAM
+        if socket_type == "UDP":
+            return socket.SOCK_DGRAM
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    @staticmethod
+    def _port_range(start, end):
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise ValueError("Port ranges must use integers")
+        if end < start:
+            raise ValueError(f"Invalid port range {start}-{end}")
+        if not (1 <= start <= 65535 and 1 <= end <= 65535):
+            raise ValueError(f"Port range {start}-{end} is outside the valid range")
+        return range(start, end + 1)
+
+    @staticmethod
+    def _check_port(host, port, socket_type):
+        sock_type = PortManager._socket_family(socket_type)
+        addresses = socket.getaddrinfo(host, port, socket.AF_UNSPEC, sock_type, 0, socket.AI_PASSIVE)
+        last_error = None
+
+        for family, sock_kind, proto, _, sockaddr in addresses:
+            try:
+                with closing(socket.socket(family, sock_kind, proto)) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(sockaddr)
+                return True
+            except OSError as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise OSError(f"Port {port} is unavailable on {host}: {last_error}")
+        raise OSError(f"Port {port} is unavailable on {host}")
+
+    def _allocate_port(self, host, port_range, socket_type, in_use):
+        start, end = port_range
+        with self._lock:
+            for port in self._port_range(start, end):
+                if port in in_use or port in self._banned_ports:
+                    continue
+                try:
+                    self._check_port(host, port, socket_type)
+                    if host not in ("0.0.0.0", "::"):
+                        try:
+                            self._check_port("0.0.0.0", port, socket_type)
+                        except OSError:
+                            continue
+                    in_use.add(port)
+                    return port
+                except OSError:
+                    continue
+        raise RuntimeError(f"Could not find a free {socket_type} port between {start} and {end} on host {host}")
+
+    def get_free_tcp_port(self, port_range=None):
+        port_range = self._console_port_range if port_range is None else tuple(port_range)
+        return self._allocate_port(self._console_host, port_range, "TCP", self._used_tcp_ports)
+
+    def get_free_udp_port(self, port_range=None):
+        port_range = self._udp_port_range if port_range is None else tuple(port_range)
+        return self._allocate_port(self._udp_host, port_range, "UDP", self._used_udp_ports)
+
+    def reserve_tcp_port(self, port, port_range=None):
+        port_range = self._console_port_range if port_range is None else tuple(port_range)
+        if port in self._used_tcp_ports:
+            raise ValueError(f"TCP port {port} is already reserved")
+        start, end = port_range
+        if not (start <= port <= end):
+            raise ValueError(f"TCP port {port} is outside the reserved range {start}-{end}")
+        with self._lock:
+            self._check_port(self._console_host, port, "TCP")
+            self._used_tcp_ports.add(port)
+        return port
+
+    def reserve_udp_port(self, port, port_range=None):
+        port_range = self._udp_port_range if port_range is None else tuple(port_range)
+        if port in self._used_udp_ports:
+            raise ValueError(f"UDP port {port} is already reserved")
+        start, end = port_range
+        if not (start <= port <= end):
+            raise ValueError(f"UDP port {port} is outside the reserved range {start}-{end}")
+        with self._lock:
+            self._check_port(self._udp_host, port, "UDP")
+            self._used_udp_ports.add(port)
+        return port
+
+    def release_tcp_port(self, port):
+        with self._lock:
+            self._used_tcp_ports.discard(port)
+
+    def release_udp_port(self, port):
+        with self._lock:
+            self._used_udp_ports.discard(port)
+
+    @property
+    def tcp_ports(self):
+        return set(self._used_tcp_ports)
+
+    @property
+    def udp_ports(self):
+        return set(self._used_udp_ports)

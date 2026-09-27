@@ -1,0 +1,8 @@
+[project]
+name = "network-modernization-pr"
+version = "0.1.0"
+description = "Small first PR for network modernization: port manager correctness and concurrency"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
